@@ -1,4 +1,4 @@
-# mod-autoloot
+# mod-autoloot (wip)
 
 ## Description
 
