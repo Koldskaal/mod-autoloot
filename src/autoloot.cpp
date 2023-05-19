@@ -1,59 +1,65 @@
 #include "ScriptMgr.h"
+#include "LootMgr.h"
 #include "Player.h"
+#include "Spell.h"
 #include "Creature.h"
 #include "Group.h"
 #include "WorldSession.h"
 #include "WorldPacket.h"
 #include "LootItemStorage.h"
 #include <vector>
+#include <list>
 
 class AutoLoot : public PlayerScript
 {
 public:
     AutoLoot() : PlayerScript("AutoLoot") {}
 
-    void OnCreatureKill(Player *player, Creature *creature)
+    void OnSpellCast(Player *player, Spell *spell, bool /*skipCheck*/) override
     {
-        ObjectGuid lguid = player->GetLootGUID();
-        // get any loot the creature has
-        Loot *loot(&creature->loot);
-
-        // check if player is in group
-        // i'm still looking into how to make this work
-        if (Group *grp = player->GetGroup())
+        if (spell->GetSpellInfo()->Id == 100011)
         {
-            for (GroupReference *itr = grp->GetFirstMember(); itr != nullptr; itr = itr->next())
+            if (!player->HasAura(100010))
+                return; // need to have the loot spell on
+            Creature *creature = nullptr;
+            std::list<Creature *> creaturedie;
+            player->GetDeadCreatureListInGrid(creaturedie, 45); // Radius is 45 for now
+            for (std::list<Creature *>::iterator itr = creaturedie.begin(); itr != creaturedie.end(); ++itr)
             {
-                Player *target = itr->GetSource();
-                if (target && target->IsInMap(player) && grp->SameSubGroup(player, target))
-                {
-                    SendLoot(target, creature->GetGUID(), LOOT_CORPSE); // Open corpse to start rolls
-                    if (target->isAllowedToLoot(creature))
-                    {
+                creature = *itr;
+                if (!creature)
+                    continue;
 
-                        if (!loot->isLooted() && !loot->empty())
-                        {
-                            LootMoney(target, lguid, loot);
-                            LootItems(target, lguid, loot);
-                        }
+                if (creature->IsAlive())
+                    continue;
+
+                ObjectGuid lguid = player->GetLootGUID();
+                // get any loot the creature has
+                Loot *loot(&creature->loot);
+
+                if (player->isAllowedToLoot(creature))
+                {
+                    if (!loot->isLooted() && !loot->empty())
+                    {
+                        StartLootRoll(player, creature->GetGUID(), LOOT_CORPSE, creature); // Open corpse to start rolls
+                        LootMoney(player, lguid, loot);
+                        LootItems(player, lguid, loot, creature);
                     }
                 }
-            }
-        }
-        else
-        {
-            if (player->isAllowedToLoot(creature))
-            {
-                if (!loot->isLooted() && !loot->empty())
+                if (loot->isLooted() && creature->HasDynamicFlag(UNIT_DYNFLAG_LOOTABLE))
                 {
-                    // Loot bot check here
-                    LootMoney(player, lguid, loot);
-                    LootItems(player, lguid, loot);
+                    if (!creature->IsAlive())
+                        creature->AllLootRemovedFromCorpse();
+
+                    creature->RemoveDynamicFlag(UNIT_DYNFLAG_LOOTABLE);
+                    LOG_DEBUG("module", "AUTOLOOT: Clearing loot done");
                 }
             }
         }
     }
-    void LootMoney(Player *player, ObjectGuid guid, Loot *loot)
+
+    void
+    LootMoney(Player *player, ObjectGuid guid, Loot *loot)
     {
         // if (!guid)
         //     return;
@@ -110,7 +116,7 @@ public:
                 player->GetSession()->DoLootRelease(guid);
         }
     };
-    void LootItems(Player *player, ObjectGuid lguid, Loot *loot)
+    void LootItems(Player *player, ObjectGuid lguid, Loot *loot, Creature *creature)
     {
         ItemTemplate const *item;
         Group *grp = player->GetGroup();
@@ -144,6 +150,7 @@ public:
                     // roll for over-threshold item if it's one-player loot
                     if (item->Quality >= uint32(grp->GetLootThreshold()))
                     {
+
                         continue;
                     }
                     break;
@@ -163,148 +170,110 @@ public:
                 lootItem->is_looted = true;
                 loot->NotifyItemRemoved(lootItem->itemIndex);
                 loot->unlootedCount--;
-
                 player->SendItemRetrievalMail(lootItem->itemid, lootItem->count);
             }
-            LOG_DEBUG("module", "ItemID: {} islooted: {}\n", lootItem->itemid, loot->isLooted());
+            else if (msg == EQUIP_ERR_INVENTORY_FULL)  // fix for inventory full spam
+            {
+                // if the round robin player release, reset it.
+                if (player->GetGUID() == loot->roundRobinPlayer)
+                {
+                    loot->roundRobinPlayer.Clear();
+
+                    if (Group *group = player->GetGroup())
+                        group->SendLooter(creature, nullptr);
+                }
+                // force dynflag update to update looter and lootable info
+                creature->ForceValuesUpdateAtIndex(UNIT_DYNAMIC_FLAGS);
+
+                if (!lguid.IsItem())
+                {
+                    loot->RemoveLooter(player->GetGUID());
+                }
+            }
+
+            LOG_DEBUG("module", "AUTOLOOT: ItemID: {} islooted: {}", lootItem->itemid, loot->isLooted());
             // If player is removing the last LootItem, delete the empty container.
-            if (loot->isLooted() && lguid.IsItem())
-                player->GetSession()->DoLootRelease(lguid);
         }
     }
 
-    void SendLoot(Player *player, ObjectGuid guid, LootType loot_type)
+    void StartLootRoll(Player *player, ObjectGuid guid, LootType loot_type, Creature *creature)
     {
         if (ObjectGuid lguid = player->GetLootGUID())
-            player->GetSession()->DoLootRelease(lguid);
+            return;
 
         Loot *loot = 0;
         PermissionTypes permission = ALL_PERMISSION;
 
-        LOG_DEBUG("loot", "Player::SendLootFromRange");
+        loot = &creature->loot;
 
+        if (loot->loot_type == LOOT_CORPSE) // Skip second after starting roll once
+            return;
+
+        // Xinef: Exploit fix
+        if (!creature->HasDynamicFlag(UNIT_DYNFLAG_LOOTABLE))
         {
-            Creature *creature = player->GetMap()->GetCreature(guid);
+            player->SendLootError(guid, LOOT_ERROR_DIDNT_KILL);
+            return;
+        }
 
-            // creature must be dead for another loot
-            if (!creature)
+        // the player whose group may loot the corpse
+        Player *recipient = creature->GetLootRecipient();
+        Group *recipientGroup = creature->GetLootRecipientGroup();
+        if (!recipient && !recipientGroup)
+            return;
+        LOG_DEBUG("module", "AUTOLOOT: Opening corpse for potential rolls");
+        if (loot->loot_type == LOOT_NONE)
+        {
+            // for creature, loot is filled when creature is killed.
+            if (recipientGroup)
             {
-                player->SendLootRelease(guid);
-                return;
-            }
-
-            loot = &creature->loot;
-
-            {
-                // Xinef: Exploit fix
-                if (!creature->HasDynamicFlag(UNIT_DYNFLAG_LOOTABLE))
+                switch (recipientGroup->GetLootMethod())
                 {
-                    player->SendLootError(guid, LOOT_ERROR_DIDNT_KILL);
-                    return;
-                }
-
-                // the player whose group may loot the corpse
-                Player *recipient = creature->GetLootRecipient();
-                Group *recipientGroup = creature->GetLootRecipientGroup();
-                if (!recipient && !recipientGroup)
-                    return;
-
-                if (loot->loot_type == LOOT_NONE)
-                {
-                    // for creature, loot is filled when creature is killed.
-                    if (recipientGroup)
-                    {
-                        switch (recipientGroup->GetLootMethod())
-                        {
-                        case GROUP_LOOT:
-                            // GroupLoot: rolls items over threshold. Items with quality < threshold, round robin
-                            recipientGroup->GroupLoot(loot, creature);
-                            break;
-                        case NEED_BEFORE_GREED:
-                            recipientGroup->NeedBeforeGreed(loot, creature);
-                            break;
-                        case MASTER_LOOT:
-                            recipientGroup->MasterLoot(loot, creature);
-                            break;
-                        default:
-                            break;
-                        }
-                    }
-                }
-
-                // if loot is already skinning loot then don't do anything else
-                if (loot->loot_type == LOOT_SKINNING)
-                {
-                    loot_type = LOOT_SKINNING;
-                    permission = creature->GetLootRecipientGUID() == player->GetGUID() ? OWNER_PERMISSION : NONE_PERMISSION;
-                }
-                else if (loot_type == LOOT_SKINNING)
-                {
-                    loot->clear();
-                    loot->FillLoot(creature->GetCreatureTemplate()->SkinLootId, LootTemplates_Skinning, player, true);
-                    permission = OWNER_PERMISSION;
-
-                    // Inform instance if creature is skinned.
-                    if (InstanceScript *mapInstance = creature->GetInstanceScript())
-                    {
-                        mapInstance->CreatureLooted(creature, LOOT_SKINNING);
-                    }
-
-                    // Xinef: Set new loot recipient
-                    creature->SetLootRecipient(player, false);
-                }
-                // set group rights only for loot_type != LOOT_SKINNING
-                else
-                {
-                    if (recipientGroup)
-                    {
-                        if (player->GetGroup() == recipientGroup)
-                        {
-                            switch (recipientGroup->GetLootMethod())
-                            {
-                            case MASTER_LOOT:
-                                permission = recipientGroup->GetMasterLooterGuid() == player->GetGUID() ? MASTER_PERMISSION : RESTRICTED_PERMISSION;
-                                break;
-                            case FREE_FOR_ALL:
-                                permission = ALL_PERMISSION;
-                                break;
-                            case ROUND_ROBIN:
-                                permission = ROUND_ROBIN_PERMISSION;
-                                break;
-                            default:
-                                permission = GROUP_PERMISSION;
-                                break;
-                            }
-                        }
-                        else
-                            permission = NONE_PERMISSION;
-                    }
-                    else if (recipient == player)
-                        permission = OWNER_PERMISSION;
-                    else
-                        permission = NONE_PERMISSION;
+                case GROUP_LOOT:
+                    // GroupLoot: rolls items over threshold. Items with quality < threshold, round robin
+                    recipientGroup->GroupLoot(loot, creature);
+                    break;
+                case NEED_BEFORE_GREED:
+                    recipientGroup->NeedBeforeGreed(loot, creature);
+                    break;
+                case MASTER_LOOT:
+                    recipientGroup->MasterLoot(loot, creature);
+                    break;
+                default:
+                    break;
                 }
             }
         }
 
-        // LOOT_INSIGNIA and LOOT_FISHINGHOLE unsupported by client
-        switch (loot_type)
+        if (recipientGroup)
         {
-        case LOOT_INSIGNIA:
-            loot_type = LOOT_SKINNING;
-            break;
-        case LOOT_FISHINGHOLE:
-            loot_type = LOOT_FISHING;
-            break;
-        case LOOT_FISHING_JUNK:
-            loot_type = LOOT_FISHING;
-            break;
-        default:
-            break;
+            if (player->GetGroup() == recipientGroup)
+            {
+                switch (recipientGroup->GetLootMethod())
+                {
+                case MASTER_LOOT:
+                    permission = recipientGroup->GetMasterLooterGuid() == player->GetGUID() ? MASTER_PERMISSION : RESTRICTED_PERMISSION;
+                    break;
+                case FREE_FOR_ALL:
+                    permission = ALL_PERMISSION;
+                    break;
+                case ROUND_ROBIN:
+                    permission = ROUND_ROBIN_PERMISSION;
+                    break;
+                default:
+                    permission = GROUP_PERMISSION;
+                    break;
+                }
+            }
+            else
+                permission = NONE_PERMISSION;
         }
+        else if (recipient == player)
+            permission = OWNER_PERMISSION;
+        else
+            permission = NONE_PERMISSION;
 
-        // need know merged fishing/corpse loot type for achievements
-        loot->loot_type = loot_type;
+        loot->loot_type = loot_type; // become corpse so that we dont trigger roll again
 
         if (permission != NONE_PERMISSION)
         {
